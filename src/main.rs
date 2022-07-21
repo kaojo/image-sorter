@@ -1,9 +1,10 @@
+use exif::{In, Tag};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirEntry};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let mut args: Vec<String> = env::args().collect();
@@ -36,12 +37,44 @@ fn main() {
     )
     .unwrap();
 
-    println!("Found the following images {:?}", source_image_paths);
+    if verbose {
+        println!("Found the following images {:?}", source_image_paths);
+    }
+
+    for path in source_image_paths {
+        let exifreader = exif::Reader::new();
+        let exif_data = std::fs::File::open(&path)
+            .map_err(|e| e.to_string())
+            .map(|inner| std::io::BufReader::new(inner))
+            .and_then(|mut inner| {
+                exifreader
+                    .read_from_container(&mut inner)
+                    .map_err(|e| e.to_string())
+            });
+
+        match exif_data {
+            Ok(exif) => {
+                match exif
+                    .get_field(Tag::DateTime, In::PRIMARY)
+                    .or(exif.get_field(Tag::DateTimeOriginal, In::PRIMARY))
+                    .or(exif.get_field(Tag::DateTimeDigitized, In::PRIMARY))
+                {
+                    Some(date) => {
+                        println!("Image {:?} was taken {}", path, date.display_value().with_unit(&exif))
+                    }
+                    None => eprintln!("Error in {:?}: DateTime tag is missing", &path),
+                }
+            }
+            Err(e) => {
+                eprintln!("Error in {:?}: {:?}", &path, e)
+            }
+        }
+    }
 }
 
 fn test_some_stuff_funtion(
     verbose: bool,
-    extensions: &mut HashSet<String>,
+    source_image_paths: &mut HashSet<PathBuf>,
 ) -> impl FnMut(&DirEntry) + '_ {
     move |dir_entry: &DirEntry| -> () {
         let path = dir_entry.path();
@@ -53,12 +86,12 @@ fn test_some_stuff_funtion(
         if let Some(extension) = option {
             if verbose {
                 println!(
-                    "found extensio {} for file {}",
+                    "found extension {} for file {}",
                     extension,
                     dir_entry.path().to_str().unwrap()
                 );
             }
-            extensions.insert(extension.clone().to_string());
+            source_image_paths.insert(path.canonicalize().unwrap());
         }
     }
 }
