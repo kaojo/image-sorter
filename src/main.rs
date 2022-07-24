@@ -72,6 +72,11 @@ fn main() {
     .unwrap();
 }
 
+fn exit_with_message<T>(message: &str) -> T {
+    println!("{}", message);
+    exit(1);
+}
+
 fn visit_dirs(dir: &Path, cb: &mut dyn FnMut(&DirEntry)) -> io::Result<()> {
     if dir.is_dir() {
         for entry in fs::read_dir(dir)? {
@@ -101,119 +106,53 @@ fn handle_file<'a>(
             .is_some();
 
         if is_image {
-            println!("---------------");
-            if verbose {
-                println!("Found file {:?}.", source_path);
-            }
-            let date_time_res = extract_date_time(&source_path);
-
-            match date_time_res {
-                Ok(date_time) => {
-                    if verbose {
-                        println!(
-                            "Image {:?} was taken at DateTime {}",
-                            source_path, date_time
-                        )
-                    }
-                    let mut new_path = target_directory
-                        .join(date_time.year().to_string())
-                        .join(date_time.month().to_string())
-                        .join(
-                            source_path
-                                .file_name()
-                                .expect("we only supply valid files."),
-                        );
-
-                    if new_path.exists() {
-                        println!("Filename collision detected.");
-                        println!(
-                            "The file {:?} already exists at target {:?}",
-                            source_path, new_path
-                        );
-                        if source_path.metadata().unwrap().len()
-                            == new_path.metadata().unwrap().len()
-                        {
-                            println!("Skipping the file {:?} because they already exisintg file has the same size and is likely same.", source_path)
-                        } else {
-                            let alternative_new_path = create_alternative_path(&new_path);
-                            println!("Choose a resolution:");
-                            println!(
-                                "1) Override the target file with the source file (Size {:?}).",
-                                human_bytes(
-                                    source_path
-                                        .metadata()
-                                        .expect("File should always exist")
-                                        .len() as f64
-                                )
-                            );
-                            println!(
-                                "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
-                                human_bytes(
-                                    new_path.metadata().expect("File should always exist").len() as f64
-                                )
-                            );
-                            println!(
-                                "3) Both files. The source file would be renamed to {:?}",
-                                alternative_new_path
-                                    .file_name()
-                                    .expect("Should always be a valid filename")
-                                    .to_str()
-                                    .expect("Should always be a valid filename")
-                            );
-                            let answer = loop {
-                                let mut input = String::new();
-                                _ = std::io::stdin().read_line(&mut input);
-                                input = input.trim().to_string();
-                                if ["1", "2", "3"].contains(&input.as_str()) {
-                                    println!("Your option: {}", input);
-                                    break input;
-                                } else {
-                                    println!("Invalid option {}. Choose 1, 2 or 3.", input)
-                                }
-                            };
-                            if "2" == answer {
-                                println!("Skipping file {:?}", source_path);
-                                return;
-                            } else if "3" == answer {
-                                new_path = alternative_new_path;
-                            }
-                        }
-                    }
-                    match mode {
-                        Mode::DryRun => println!(
-                            "Dry run: Copy/Move source file {:?} to target {:?}",
-                            source_path, new_path
-                        ),
-                        Mode::Move => todo!(),
-                        Mode::Copy => todo!(),
-                    }
-                }
-                Err(e) => {
-                    println!("Error in {:?}: {}", source_path, e);
-                }
-            }
+            handle_image(verbose, source_path, target_directory, mode);
         }
     }
 }
 
-fn create_alternative_path(path: &PathBuf) -> PathBuf {
-    let new_name = path
-        .file_stem()
-        .expect("Should always have a file stem.")
-        .to_str()
-        .expect("Should always have a file stem.")
-        .to_owned()
-        + "_new";
-    let mut new_path = change_file_name(path, new_name.as_str());
-    if new_path.exists() {
-        new_path = create_alternative_path(&new_path);
+fn handle_image(verbose: bool, source_path: PathBuf, target_directory: &Path, mode: &Mode) {
+    println!("---------------");
+    if verbose {
+        println!("Found file {:?}.", source_path);
     }
-    new_path
-}
+    let date_time_res = extract_date_time(&source_path);
+    match date_time_res {
+        Ok(date_time) => {
+            if verbose {
+                println!(
+                    "Image {:?} was taken at DateTime {}",
+                    source_path, date_time
+                )
+            }
+            let mut target_path = target_directory
+                .join(date_time.year().to_string())
+                .join(date_time.month().to_string())
+                .join(
+                    source_path
+                        .file_name()
+                        .expect("we only supply valid files."),
+                );
 
-fn exit_with_message<T>(message: &str) -> T {
-    println!("{}", message);
-    exit(1);
+            if target_path.exists() {
+                match handle_file_exists_at_target(&source_path, &target_path) {
+                    Some(path_resolution) => target_path = path_resolution,
+                    None => return 
+                }
+            }
+            match mode {
+                Mode::DryRun => println!(
+                    "Dry run: Copy/Move source file {:?} to target {:?}",
+                    source_path, target_path
+                ),
+                Mode::Move => todo!(),
+                Mode::Copy => todo!(),
+            }
+        }
+        Err(e) => {
+            println!("Error in {:?}: {}", source_path, e);
+        }
+    }
 }
 
 fn extract_date_time(path: &PathBuf) -> Result<NaiveDateTime, String> {
@@ -240,6 +179,83 @@ fn extract_date_time(path: &PathBuf) -> Result<NaiveDateTime, String> {
         });
     date_time
 }
+
+fn handle_file_exists_at_target(source_path: &PathBuf, target_path: &PathBuf) -> Option<PathBuf> {
+    println!("Filename collision detected.");
+                println!(
+                    "The file {:?} already exists at target {:?}",
+                    source_path, target_path
+                );
+                if source_path.metadata().unwrap().len()
+                    == target_path.metadata().unwrap().len()
+                {
+                    println!("Skipping the file {:?} because they already exisintg file has the same size and is likely same.", source_path);
+                    return None;
+                } else {
+                    let alternative_new_path = create_alternative_path(&target_path);
+                    println!("Choose a resolution:");
+                    println!(
+                        "1) Override the target file with the source file (Size {:?}).",
+                        human_bytes(
+                            source_path
+                                .metadata()
+                                .expect("File should always exist")
+                                .len() as f64
+                        )
+                    );
+                    println!(
+                        "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
+                        human_bytes(
+                            target_path.metadata().expect("File should always exist").len() as f64
+                        )
+                    );
+                    println!(
+                        "3) Both files. The source file would be renamed to {:?}",
+                        alternative_new_path
+                            .file_name()
+                            .expect("Should always be a valid filename")
+                            .to_str()
+                            .expect("Should always be a valid filename")
+                    );
+                    let answer = loop {
+                        let mut input = String::new();
+                        _ = std::io::stdin().read_line(&mut input);
+                        input = input.trim().to_string();
+                        if ["1", "2", "3"].contains(&input.as_str()) {
+                            println!("Your option: {}", input);
+                            break input;
+                        } else {
+                            println!("Invalid option {}. Choose 1, 2 or 3.", input)
+                        }
+                    };
+                    if "1" == answer {
+                        return Some(target_path.to_owned())
+                    } else if "2" == answer {
+                        println!("Skipping file {:?}", source_path);
+                        return None;
+                    } else if "3" == answer {
+                        return Some(alternative_new_path);
+                    } else {
+                        panic!("Unreachable.")
+                    }
+                }
+}
+
+fn create_alternative_path(path: &PathBuf) -> PathBuf {
+    let new_name = path
+        .file_stem()
+        .expect("Should always have a file stem.")
+        .to_str()
+        .expect("Should always have a file stem.")
+        .to_owned()
+        + "_new";
+    let mut new_path = change_file_name(path, new_name.as_str());
+    if new_path.exists() {
+        new_path = create_alternative_path(&new_path);
+    }
+    new_path
+}
+
 fn change_file_name(path: &PathBuf, name: &str) -> PathBuf {
     let mut result = path.to_owned();
     result.set_file_name(name);
