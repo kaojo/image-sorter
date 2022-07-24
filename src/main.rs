@@ -1,4 +1,4 @@
-use chrono::{Datelike, NaiveDateTime, DateTime};
+use chrono::{DateTime, Datelike, NaiveDateTime};
 use exif::{In, Tag};
 use human_bytes::human_bytes;
 use std::collections::HashSet;
@@ -219,37 +219,42 @@ fn extract_date_time(path: &PathBuf) -> Result<NaiveDateTime, String> {
     if is_image(path) {
         let exifreader = exif::Reader::new();
         std::fs::File::open(path)
-        .map_err(|e| e.to_string())
-        .map(|inner| std::io::BufReader::new(inner))
-        .and_then(|mut inner| {
-            exifreader
-            .read_from_container(&mut inner)
             .map_err(|e| e.to_string())
-        })
-        .and_then(|inner| {
-            inner
-            .get_field(Tag::DateTimeOriginal, In::PRIMARY)
-            .or(inner.get_field(Tag::DateTime, In::PRIMARY))
-            .or(inner.get_field(Tag::DateTimeDigitized, In::PRIMARY))
-            .map(|field| field.display_value().to_string())
-            .ok_or("DateTime tag is missing.".to_string())
-        })
-        .and_then(|inner| {
-            NaiveDateTime::parse_from_str(inner.as_str().trim(), "%Y-%m-%d %H:%M:%S")
-            .map_err(|e| e.to_string())
-        })
+            .map(|inner| std::io::BufReader::new(inner))
+            .and_then(|mut inner| {
+                exifreader
+                    .read_from_container(&mut inner)
+                    .map_err(|e| e.to_string())
+            })
+            .and_then(|inner| {
+                inner
+                    .get_field(Tag::DateTimeOriginal, In::PRIMARY)
+                    .or(inner.get_field(Tag::DateTime, In::PRIMARY))
+                    .or(inner.get_field(Tag::DateTimeDigitized, In::PRIMARY))
+                    .map(|field| field.display_value().to_string())
+                    .ok_or("DateTime tag is missing.".to_string())
+            })
+            .and_then(|inner| {
+                NaiveDateTime::parse_from_str(inner.as_str().trim(), "%Y-%m-%d %H:%M:%S")
+                    .map_err(|e| e.to_string())
+            })
     } else {
-        ffprobe::ffprobe(path).map_err(|e| e.to_string())?
-        .format.tags.ok_or("Can't rad mp4 creation date time.".to_string())
-        .and_then(|tag| tag.creation_time.ok_or("Can't read mp4 creation date time.".to_string()))
-        .and_then(|str| DateTime::parse_from_rfc3339(str.as_str()).map_err(|e| e.to_string()))
-        .map(|date_time| date_time.naive_local())
+        ffprobe::ffprobe(path)
+            .map_err(|e| e.to_string())?
+            .format
+            .tags
+            .ok_or("Can't rad mp4 creation date time.".to_string())
+            .and_then(|tag| {
+                tag.creation_time
+                    .ok_or("Can't read mp4 creation date time.".to_string())
+            })
+            .and_then(|str| DateTime::parse_from_rfc3339(str.as_str()).map_err(|e| e.to_string()))
+            .map(|date_time| date_time.naive_local())
     }
 }
 
 fn is_image(path: &PathBuf) -> bool {
-    path
-        .extension()
+    path.extension()
         .and_then(OsStr::to_str)
         .filter(|&e| ["png", "jpg", "tif"].contains(&e.to_lowercase().as_str()))
         .is_some()
