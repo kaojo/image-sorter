@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4.19"
+ffprobe = "0.3.2"
 human_bytes = "0.3.1"
 kamadak-exif = "0.5.4"

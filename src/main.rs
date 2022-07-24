@@ -1,4 +1,4 @@
-use chrono::{Datelike, NaiveDateTime};
+use chrono::{Datelike, NaiveDateTime, DateTime};
 use exif::{In, Tag};
 use human_bytes::human_bytes;
 use std::collections::HashSet;
@@ -42,7 +42,7 @@ fn main() {
             if mode_set {
                 exit_with_message::<bool>("Only one mode can be chosen.");
             }
-            mode = Mode::Copy;
+            mode = Mode::Move;
             mode_set = true;
         } else if arg == "--target" || arg == "-t" {
             target_folder = args.get(i + 1);
@@ -65,9 +65,11 @@ fn main() {
             "Target folder does not exists or you are missing the required permissions.",
         );
     }
+
+    let mut target_parents = HashSet::new();
     visit_dirs(
         &source_directory,
-        &mut handle_file(verbose, target_directory, &mode),
+        &mut handle_file(verbose, target_directory, &mode, &mut target_parents),
     )
     .unwrap();
 }
@@ -96,149 +98,223 @@ fn handle_file<'a>(
     verbose: bool,
     target_directory: &'a Path,
     mode: &'a Mode,
+    target_parents: &'a mut HashSet<PathBuf>,
 ) -> impl FnMut(&DirEntry) + 'a {
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
-        let is_image = source_path
-            .extension()
-            .and_then(OsStr::to_str)
-            .filter(|&e| HashSet::from(["png", "jpg", "tif"]).contains(e))
-            .is_some();
 
-        if is_image {
-            handle_image(verbose, source_path, target_directory, mode);
+        if is_supported_file_type(&source_path) {
+            match handle_image(
+                verbose,
+                &source_path,
+                target_directory,
+                mode,
+                target_parents,
+            ) {
+                Ok(target_file) => {
+                    let parent = target_file
+                        .parent()
+                        .expect("File and parent exist")
+                        .to_owned()
+                        .clone();
+                    if !target_parents.contains(&parent) {
+                        target_parents.insert(parent);
+                    }
+                }
+                Err(e) => {
+                    println!("Error in {:?}: {}", source_path, e);
+                }
+            }
+        } else {
+            if verbose {
+                println!("=========");
+                println!("File {:?} is not a supported file type", source_path);
+            }
         }
     }
 }
 
-fn handle_image(verbose: bool, source_path: PathBuf, target_directory: &Path, mode: &Mode) {
+fn is_supported_file_type(source_path: &PathBuf) -> bool {
+    let is_supported = source_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .filter(|&e| ["png", "jpg", "tif", "mp4"].contains(&e.to_lowercase().as_str()))
+        .is_some();
+    is_supported
+}
+
+fn handle_image(
+    verbose: bool,
+    source_path: &PathBuf,
+    target_directory: &Path,
+    mode: &Mode,
+    target_parents: &HashSet<PathBuf>,
+) -> Result<PathBuf, String> {
     println!("---------------");
     if verbose {
         println!("Found file {:?}.", source_path);
     }
-    let date_time_res = extract_date_time(&source_path);
-    match date_time_res {
-        Ok(date_time) => {
-            if verbose {
-                println!(
-                    "Image {:?} was taken at DateTime {}",
-                    source_path, date_time
-                )
-            }
-            let mut target_path = target_directory
-                .join(date_time.year().to_string())
-                .join(date_time.month().to_string())
-                .join(
-                    source_path
-                        .file_name()
-                        .expect("we only supply valid files."),
-                );
+    let date_time = extract_date_time(&source_path)?;
+    if verbose {
+        println!(
+            "Image {:?} was taken at DateTime {}",
+            source_path, date_time
+        )
+    }
+    let mut target_path = target_directory
+        .join(date_time.year().to_string())
+        .join(date_time.month().to_string())
+        .join(
+            source_path
+                .file_name()
+                .expect("we only supply valid files."),
+        );
 
-            if target_path.exists() {
-                match handle_file_exists_at_target(&source_path, &target_path) {
-                    Some(path_resolution) => target_path = path_resolution,
-                    None => return 
-                }
-            }
-            match mode {
-                Mode::DryRun => println!(
-                    "Dry run: Copy/Move source file {:?} to target {:?}",
-                    source_path, target_path
-                ),
-                Mode::Move => todo!(),
-                Mode::Copy => todo!(),
-            }
-        }
-        Err(e) => {
-            println!("Error in {:?}: {}", source_path, e);
+    if target_path.exists() {
+        match handle_file_exists_at_target(&source_path, &target_path) {
+            Some(path_resolution) => target_path = path_resolution,
+            None => return Ok(target_path),
         }
     }
+    match mode {
+        Mode::DryRun => println!(
+            "Dry run: Copy/Move source file {:?} to target {:?}",
+            source_path, target_path
+        ),
+        Mode::Move => {
+            handle_missing_parents(verbose, &target_path, target_parents)?;
+            println!(
+                "Moving source file {:?} to target {:?}",
+                source_path, target_path
+            );
+            fs::rename(&source_path, &target_path).map_err(|e| e.to_string())?;
+        }
+        Mode::Copy => {
+            handle_missing_parents(verbose, &target_path, target_parents)?;
+            println!(
+                "Copying source file {:?} to target {:?}",
+                source_path, target_path
+            );
+            fs::copy(&source_path, &target_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(target_path)
+}
+
+fn handle_missing_parents<'a>(
+    verbose: bool,
+    target_path: &'a PathBuf,
+    target_parents: &HashSet<PathBuf>,
+) -> Result<(), String> {
+    let parent = target_path.parent().expect("is valid.");
+    Ok(if !target_parents.contains(&parent.to_path_buf()) {
+        if verbose {
+            println!("Creating folder {:?}", parent);
+        }
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    })
 }
 
 fn extract_date_time(path: &PathBuf) -> Result<NaiveDateTime, String> {
-    let exifreader = exif::Reader::new();
-    let date_time = std::fs::File::open(path)
+    if is_image(path) {
+        let exifreader = exif::Reader::new();
+        std::fs::File::open(path)
         .map_err(|e| e.to_string())
         .map(|inner| std::io::BufReader::new(inner))
         .and_then(|mut inner| {
             exifreader
-                .read_from_container(&mut inner)
-                .map_err(|e| e.to_string())
+            .read_from_container(&mut inner)
+            .map_err(|e| e.to_string())
         })
         .and_then(|inner| {
             inner
-                .get_field(Tag::DateTimeOriginal, In::PRIMARY)
-                .or(inner.get_field(Tag::DateTime, In::PRIMARY))
-                .or(inner.get_field(Tag::DateTimeDigitized, In::PRIMARY))
-                .map(|field| field.display_value().to_string())
-                .ok_or("DateTime tag is missing.".to_string())
+            .get_field(Tag::DateTimeOriginal, In::PRIMARY)
+            .or(inner.get_field(Tag::DateTime, In::PRIMARY))
+            .or(inner.get_field(Tag::DateTimeDigitized, In::PRIMARY))
+            .map(|field| field.display_value().to_string())
+            .ok_or("DateTime tag is missing.".to_string())
         })
         .and_then(|inner| {
             NaiveDateTime::parse_from_str(inner.as_str().trim(), "%Y-%m-%d %H:%M:%S")
-                .map_err(|e| e.to_string())
-        });
-    date_time
+            .map_err(|e| e.to_string())
+        })
+    } else {
+        ffprobe::ffprobe(path).map_err(|e| e.to_string())?
+        .format.tags.ok_or("Can't rad mp4 creation date time.".to_string())
+        .and_then(|tag| tag.creation_time.ok_or("Can't read mp4 creation date time.".to_string()))
+        .and_then(|str| DateTime::parse_from_rfc3339(str.as_str()).map_err(|e| e.to_string()))
+        .map(|date_time| date_time.naive_local())
+    }
+}
+
+fn is_image(path: &PathBuf) -> bool {
+    path
+        .extension()
+        .and_then(OsStr::to_str)
+        .filter(|&e| ["png", "jpg", "tif"].contains(&e.to_lowercase().as_str()))
+        .is_some()
 }
 
 fn handle_file_exists_at_target(source_path: &PathBuf, target_path: &PathBuf) -> Option<PathBuf> {
     println!("Filename collision detected.");
-                println!(
-                    "The file {:?} already exists at target {:?}",
-                    source_path, target_path
-                );
-                if source_path.metadata().unwrap().len()
-                    == target_path.metadata().unwrap().len()
-                {
-                    println!("Skipping the file {:?} because they already exisintg file has the same size and is likely same.", source_path);
-                    return None;
-                } else {
-                    let alternative_new_path = create_alternative_path(&target_path);
-                    println!("Choose a resolution:");
-                    println!(
-                        "1) Override the target file with the source file (Size {:?}).",
-                        human_bytes(
-                            source_path
-                                .metadata()
-                                .expect("File should always exist")
-                                .len() as f64
-                        )
-                    );
-                    println!(
-                        "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
-                        human_bytes(
-                            target_path.metadata().expect("File should always exist").len() as f64
-                        )
-                    );
-                    println!(
-                        "3) Both files. The source file would be renamed to {:?}",
-                        alternative_new_path
-                            .file_name()
-                            .expect("Should always be a valid filename")
-                            .to_str()
-                            .expect("Should always be a valid filename")
-                    );
-                    let answer = loop {
-                        let mut input = String::new();
-                        _ = std::io::stdin().read_line(&mut input);
-                        input = input.trim().to_string();
-                        if ["1", "2", "3"].contains(&input.as_str()) {
-                            println!("Your option: {}", input);
-                            break input;
-                        } else {
-                            println!("Invalid option {}. Choose 1, 2 or 3.", input)
-                        }
-                    };
-                    if "1" == answer {
-                        return Some(target_path.to_owned())
-                    } else if "2" == answer {
-                        println!("Skipping file {:?}", source_path);
-                        return None;
-                    } else if "3" == answer {
-                        return Some(alternative_new_path);
-                    } else {
-                        panic!("Unreachable.")
-                    }
-                }
+    println!(
+        "The file {:?} already exists at target {:?}",
+        source_path, target_path
+    );
+    if source_path.metadata().unwrap().len() == target_path.metadata().unwrap().len() {
+        println!("Skipping the file {:?} because they already existing file has the same size and is likely same.", source_path);
+        return None;
+    } else {
+        let alternative_new_path = create_alternative_path(&target_path);
+        println!("Choose a resolution:");
+        println!(
+            "1) Override the target file with the source file (Size {:?}).",
+            human_bytes(
+                source_path
+                    .metadata()
+                    .expect("File should always exist")
+                    .len() as f64
+            )
+        );
+        println!(
+            "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
+            human_bytes(
+                target_path
+                    .metadata()
+                    .expect("File should always exist")
+                    .len() as f64
+            )
+        );
+        println!(
+            "3) Both files. The source file would be renamed to {:?}",
+            alternative_new_path
+                .file_name()
+                .expect("Should always be a valid filename")
+                .to_str()
+                .expect("Should always be a valid filename")
+        );
+        let answer = loop {
+            let mut input = String::new();
+            _ = std::io::stdin().read_line(&mut input);
+            input = input.trim().to_string();
+            if ["1", "2", "3"].contains(&input.as_str()) {
+                println!("Your option: {}", input);
+                break input;
+            } else {
+                println!("Invalid option {}. Choose 1, 2 or 3.", input)
+            }
+        };
+        if "1" == answer {
+            return Some(target_path.to_owned());
+        } else if "2" == answer {
+            println!("Skipping file {:?}", source_path);
+            return None;
+        } else if "3" == answer {
+            return Some(alternative_new_path);
+        } else {
+            panic!("Unreachable.")
+        }
+    }
 }
 
 fn create_alternative_path(path: &PathBuf) -> PathBuf {
