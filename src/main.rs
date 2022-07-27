@@ -21,6 +21,7 @@ fn main() {
     let mut source_folder = Option::None;
     let mut target_folder = Option::None;
     let mut skip_read_next_value = false;
+    let mut conflict_mode = ConflictMode::Choose;
     for (i, arg) in args.iter().enumerate() {
         if skip_read_next_value {
             skip_read_next_value = false;
@@ -48,6 +49,15 @@ fn main() {
             mode_set = true;
         } else if arg == "--target" || arg == "-t" {
             target_folder = args.get(i + 1);
+            skip_read_next_value = true;
+        } else if arg == "--conflict-mode" || arg == "-k" {
+            let cm = args.get(i + 1).map(|s| s.as_str());
+            conflict_mode = match cm {
+                Some("both") => ConflictMode::KeepBoth,
+                Some("source") => ConflictMode::KeepSource,
+                Some("target") => ConflictMode::KeepTarget,
+                _ => ConflictMode::Choose,
+            };
             skip_read_next_value = true;
         } else {
             if source_folder.is_none() {
@@ -79,6 +89,7 @@ fn main() {
             &mode,
             &mut target_parents,
             &date_regex,
+            &conflict_mode,
         ),
     )
     .unwrap();
@@ -110,6 +121,7 @@ fn handle_file<'a>(
     mode: &'a Mode,
     target_parents: &'a mut HashSet<PathBuf>,
     date_regex: &'a Regex,
+    conflict_mode: &'a ConflictMode,
 ) -> impl FnMut(&DirEntry) + 'a {
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
@@ -122,6 +134,7 @@ fn handle_file<'a>(
                 mode,
                 target_parents,
                 date_regex,
+                conflict_mode,
             ) {
                 Ok(target_file) => {
                     let parent = target_file
@@ -162,6 +175,7 @@ fn handle_image(
     mode: &Mode,
     target_parents: &HashSet<PathBuf>,
     date_regex: &Regex,
+    conflict_mode: &ConflictMode,
 ) -> Result<PathBuf, String> {
     println!("---------------");
     if verbose {
@@ -184,7 +198,7 @@ fn handle_image(
         );
 
     if target_path.exists() {
-        match handle_file_exists_at_target(&source_path, &target_path) {
+        match handle_file_exists_at_target(&source_path, &target_path, conflict_mode) {
             Some(path_resolution) => target_path = path_resolution,
             None => return Ok(target_path),
         }
@@ -279,8 +293,7 @@ fn extract_media_creation_time_from_filename<'a>(
     || {
         let file_name = &path.file_name().map(|s| s.to_str()).unwrap().unwrap();
         match date_regex.captures_iter(file_name).count() {
-        1 => {
-            date_regex
+            1 => date_regex
                 .captures(file_name)
                 .filter(|c| c.len() == 4)
                 .and_then(|c| {
@@ -293,13 +306,10 @@ fn extract_media_creation_time_from_filename<'a>(
                         NaiveDate::from_ymd(s.0, s.1 as u32, 1),
                         NaiveTime::from_hms(0, 0, 0),
                     )
-                })
-        }
-        _ => {
-            None
+                }),
+            _ => None,
         }
     }
-}
 }
 
 fn extract_media_creation_time_from_file_metadata<'a>(
@@ -394,7 +404,11 @@ fn is_image(path: &PathBuf) -> bool {
         .is_some()
 }
 
-fn handle_file_exists_at_target(source_path: &PathBuf, target_path: &PathBuf) -> Option<PathBuf> {
+fn handle_file_exists_at_target(
+    source_path: &PathBuf,
+    target_path: &PathBuf,
+    conflict_mode: &ConflictMode,
+) -> Option<PathBuf> {
     println!("Filename collision detected.");
     println!(
         "The file {:?} already exists at target {:?}",
@@ -405,53 +419,60 @@ fn handle_file_exists_at_target(source_path: &PathBuf, target_path: &PathBuf) ->
         return None;
     } else {
         let alternative_new_path = create_alternative_path(&target_path);
-        println!("Choose a resolution:");
-        println!(
-            "1) Override the target file with the source file (Size {:?}).",
-            human_bytes(
-                source_path
-                    .metadata()
-                    .expect("File should always exist")
-                    .len() as f64
-            )
-        );
-        println!(
-            "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
-            human_bytes(
-                target_path
-                    .metadata()
-                    .expect("File should always exist")
-                    .len() as f64
-            )
-        );
-        println!(
-            "3) Both files. The source file would be renamed to {:?}",
-            alternative_new_path
-                .file_name()
-                .expect("Should always be a valid filename")
-                .to_str()
-                .expect("Should always be a valid filename")
-        );
-        let answer = loop {
-            let mut input = String::new();
-            _ = std::io::stdin().read_line(&mut input);
-            input = input.trim().to_string();
-            if ["1", "2", "3"].contains(&input.as_str()) {
-                println!("Your option: {}", input);
-                break input;
-            } else {
-                println!("Invalid option {}. Choose 1, 2 or 3.", input)
+        match conflict_mode {
+            ConflictMode::Choose => {
+                println!("Choose a resolution:");
+                println!(
+                    "1) Override the target file with the source file (Size {:?}).",
+                    human_bytes(
+                        source_path
+                            .metadata()
+                            .expect("File should always exist")
+                            .len() as f64
+                    )
+                );
+                println!(
+                "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
+                human_bytes(
+                    target_path
+                        .metadata()
+                        .expect("File should always exist")
+                        .len() as f64
+                )
+            );
+                println!(
+                    "3) Both files. The source file would be renamed to {:?}",
+                    alternative_new_path
+                        .file_name()
+                        .expect("Should always be a valid filename")
+                        .to_str()
+                        .expect("Should always be a valid filename")
+                );
+                let answer = loop {
+                    let mut input = String::new();
+                    _ = std::io::stdin().read_line(&mut input);
+                    input = input.trim().to_string();
+                    if ["1", "2", "3"].contains(&input.as_str()) {
+                        println!("Your option: {}", input);
+                        break input;
+                    } else {
+                        println!("Invalid option {}. Choose 1, 2 or 3.", input)
+                    }
+                };
+                if "1" == answer {
+                    return Some(target_path.to_owned());
+                } else if "2" == answer {
+                    println!("Skipping file {:?}", source_path);
+                    return None;
+                } else if "3" == answer {
+                    return Some(alternative_new_path);
+                } else {
+                    panic!("Unreachable.")
+                }
             }
-        };
-        if "1" == answer {
-            return Some(target_path.to_owned());
-        } else if "2" == answer {
-            println!("Skipping file {:?}", source_path);
-            return None;
-        } else if "3" == answer {
-            return Some(alternative_new_path);
-        } else {
-            panic!("Unreachable.")
+            ConflictMode::KeepSource => Some(target_path.to_owned()),
+            ConflictMode::KeepTarget => None,
+            ConflictMode::KeepBoth => Some(alternative_new_path),
         }
     }
 }
@@ -484,4 +505,11 @@ enum Mode {
     DryRun,
     Move,
     Copy,
+}
+
+enum ConflictMode {
+    Choose,
+    KeepSource,
+    KeepTarget,
+    KeepBoth,
 }
