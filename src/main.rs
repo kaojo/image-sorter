@@ -1,6 +1,7 @@
-use chrono::{DateTime, Datelike, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDateTime, NaiveDate, NaiveTime};
 use exif::{In, Tag};
 use human_bytes::human_bytes;
+use regex::Regex;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
@@ -8,6 +9,7 @@ use std::fs::{self, DirEntry};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::time::UNIX_EPOCH;
 
 fn main() {
     let mut args: Vec<String> = env::args().collect();
@@ -67,9 +69,17 @@ fn main() {
     }
 
     let mut target_parents = HashSet::new();
+    let date_regex = Regex::new(r"(20[012]\d[01]\d\d{2})").unwrap();
+
     visit_dirs(
         &source_directory,
-        &mut handle_file(verbose, target_directory, &mode, &mut target_parents),
+        &mut handle_file(
+            verbose,
+            target_directory,
+            &mode,
+            &mut target_parents,
+            &date_regex,
+        ),
     )
     .unwrap();
 }
@@ -99,6 +109,7 @@ fn handle_file<'a>(
     target_directory: &'a Path,
     mode: &'a Mode,
     target_parents: &'a mut HashSet<PathBuf>,
+    date_regex: &'a Regex,
 ) -> impl FnMut(&DirEntry) + 'a {
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
@@ -110,6 +121,7 @@ fn handle_file<'a>(
                 target_directory,
                 mode,
                 target_parents,
+                date_regex,
             ) {
                 Ok(target_file) => {
                     let parent = target_file
@@ -138,7 +150,7 @@ fn is_supported_file_type(source_path: &PathBuf) -> bool {
     let is_supported = source_path
         .extension()
         .and_then(OsStr::to_str)
-        .filter(|&e| ["png", "jpg", "tif", "mp4"].contains(&e.to_lowercase().as_str()))
+        .filter(|&e| ["png", "jpg", "jpeg", "tif", "mp4"].contains(&e.to_lowercase().as_str()))
         .is_some();
     is_supported
 }
@@ -149,12 +161,13 @@ fn handle_image(
     target_directory: &Path,
     mode: &Mode,
     target_parents: &HashSet<PathBuf>,
+    date_regex: &Regex,
 ) -> Result<PathBuf, String> {
     println!("---------------");
     if verbose {
         println!("Found file {:?}.", source_path);
     }
-    let date_time = extract_date_time(&source_path)?;
+    let date_time = extract_date_time(&source_path, date_regex)?;
     if verbose {
         println!(
             "Image {:?} was taken at DateTime {}",
@@ -215,8 +228,8 @@ fn handle_missing_parents<'a>(
     })
 }
 
-fn extract_date_time(path: &PathBuf) -> Result<NaiveDateTime, String> {
-    if is_image(path) {
+fn extract_date_time(path: &PathBuf, date_regex: &Regex) -> Result<NaiveDateTime, String> {
+    let result_from_media_metadata = if is_image(path) {
         let exifreader = exif::Reader::new();
         std::fs::File::open(path)
             .map_err(|e| e.to_string())
@@ -250,13 +263,114 @@ fn extract_date_time(path: &PathBuf) -> Result<NaiveDateTime, String> {
             })
             .and_then(|str| DateTime::parse_from_rfc3339(str.as_str()).map_err(|e| e.to_string()))
             .map(|date_time| date_time.naive_local())
+    };
+
+    result_from_media_metadata
+        .ok()
+        .or_else(extract_media_creation_time_from_filename(date_regex, path))
+        .or_else(extract_media_creation_time_from_file_metadata(path))
+        .ok_or("Could not determine a media file creation date.".to_owned())
+}
+
+fn extract_media_creation_time_from_filename<'a>(
+    date_regex: &'a Regex,
+    path: &'a PathBuf,
+) -> impl FnOnce() -> Option<NaiveDateTime> + 'a {
+    || {
+        date_regex
+            .captures(path.file_name().map(|s| s.to_str()).unwrap().unwrap())
+            .filter(|c| c.len() == 1)
+            .map(|c| c.get(0).unwrap().as_str())
+            .and_then(|s| {
+                NaiveDateTime::parse_from_str(
+                    (s.to_owned() + " 0:0:0").as_str().trim(),
+                    "%Y%m%d %H:%M:%S",
+                )
+                .ok()
+            })
+    }
+}
+
+fn extract_media_creation_time_from_file_metadata<'a>(
+    path: &'a PathBuf,
+) -> impl FnOnce() -> Option<NaiveDateTime> + 'a {
+    move || {
+        let file_creation_date = path
+            .metadata()
+            .and_then(|m| m.created())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| NaiveDateTime::from_timestamp_opt(duration.as_secs() as i64, 0));
+
+        match file_creation_date {
+            Some(date) => {
+                println!(
+                    "Could not determine creation time of media file {:?}",
+                    &path
+                );
+                println!("Choose a resolution:");
+                println!("1) Use the file creation time: {:?}", date);
+                println!("2) Enter year and month manually.");
+                let answer = loop {
+                    let mut input = String::new();
+                    _ = std::io::stdin().read_line(&mut input);
+                    input = input.trim().to_string();
+                    if ["1", "2"].contains(&input.as_str()) {
+                        println!("Your option: {}", input);
+                        break input;
+                    } else {
+                        println!("Invalid option {}. Choose 1, 2", input)
+                    }
+                };
+                if "1" == answer {
+                    return Some(date);
+                } else if "2" == answer {
+                    println!("Enter the year as number, e.g. 2022");
+                    let year = loop {
+                        let mut input = String::new();
+                        _ = std::io::stdin().read_line(&mut input);
+                        input = input.trim().to_string();
+                        if input.len() != 4 {
+                            println!("Invalid input {}. expected a 4 digit number, e.g. 2022", input);
+                            continue;
+                        }
+                        if let Ok(year) = input.parse::<i32>() {
+                            println!("Your option: {}", input);
+                            break year;
+                        } else {
+                            println!("Invalid input {}. expected a number, e.g. 2022", input)
+                        }
+                    };
+                    println!("Enter the month as number, e.g. 12");
+                    let month = loop {
+                        let mut input = String::new();
+                        _ = std::io::stdin().read_line(&mut input);
+                        input = input.trim().to_string();
+                        if input.len() != 2 {
+                            println!("Invalid input {}. expected a two digit number, e.g. 12", input);
+                            continue;
+                        }
+                        if let Ok(month) = input.parse::<u32>() {
+                            println!("Your option: {}", input);
+                            break month;
+                        } else {
+                            println!("Invalid input {}. expected a number, e.g. 12", input)
+                        }
+                    };
+                    return Some(NaiveDateTime::new(NaiveDate::from_ymd(year, month, 1), NaiveTime::from_hms(0,0,0)));
+                } else {
+                    panic!("Unreachable.")
+                }
+            }
+            None => None,
+        }
     }
 }
 
 fn is_image(path: &PathBuf) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
-        .filter(|&e| ["png", "jpg", "tif"].contains(&e.to_lowercase().as_str()))
+        .filter(|&e| ["png", "jpg", "jpeg", "tif"].contains(&e.to_lowercase().as_str()))
         .is_some()
 }
 
