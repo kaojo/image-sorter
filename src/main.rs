@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, NaiveDateTime, NaiveDate, NaiveTime};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 use exif::{In, Tag};
 use human_bytes::human_bytes;
 use regex::Regex;
@@ -69,7 +69,7 @@ fn main() {
     }
 
     let mut target_parents = HashSet::new();
-    let date_regex = Regex::new(r"(20[012]\d[01]\d\d{2})").unwrap();
+    let date_regex = Regex::new(r"(?P<y>20[012]\d)\-?(?P<m>[01]\d)\-?(?P<d>\d{2})").unwrap();
 
     visit_dirs(
         &source_directory,
@@ -277,18 +277,29 @@ fn extract_media_creation_time_from_filename<'a>(
     path: &'a PathBuf,
 ) -> impl FnOnce() -> Option<NaiveDateTime> + 'a {
     || {
-        date_regex
-            .captures(path.file_name().map(|s| s.to_str()).unwrap().unwrap())
-            .filter(|c| c.len() == 1)
-            .map(|c| c.get(0).unwrap().as_str())
-            .and_then(|s| {
-                NaiveDateTime::parse_from_str(
-                    (s.to_owned() + " 0:0:0").as_str().trim(),
-                    "%Y%m%d %H:%M:%S",
-                )
-                .ok()
-            })
+        let file_name = &path.file_name().map(|s| s.to_str()).unwrap().unwrap();
+        match date_regex.captures_iter(file_name).count() {
+        1 => {
+            date_regex
+                .captures(file_name)
+                .filter(|c| c.len() == 4)
+                .and_then(|c| {
+                    c.name("y")
+                        .and_then(|s| s.as_str().parse::<i32>().ok())
+                        .zip(c.name("m").and_then(|s| s.as_str().parse::<i32>().ok()))
+                })
+                .map(|s| {
+                    NaiveDateTime::new(
+                        NaiveDate::from_ymd(s.0, s.1 as u32, 1),
+                        NaiveTime::from_hms(0, 0, 0),
+                    )
+                })
+        }
+        _ => {
+            None
+        }
     }
+}
 }
 
 fn extract_media_creation_time_from_file_metadata<'a>(
@@ -297,7 +308,7 @@ fn extract_media_creation_time_from_file_metadata<'a>(
     move || {
         let file_creation_date = path
             .metadata()
-            .and_then(|m| m.created())
+            .and_then(|m| m.modified().or(m.created()))
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| NaiveDateTime::from_timestamp_opt(duration.as_secs() as i64, 0));
@@ -331,7 +342,10 @@ fn extract_media_creation_time_from_file_metadata<'a>(
                         _ = std::io::stdin().read_line(&mut input);
                         input = input.trim().to_string();
                         if input.len() != 4 {
-                            println!("Invalid input {}. expected a 4 digit number, e.g. 2022", input);
+                            println!(
+                                "Invalid input {}. expected a 4 digit number, e.g. 2022",
+                                input
+                            );
                             continue;
                         }
                         if let Ok(year) = input.parse::<i32>() {
@@ -347,7 +361,10 @@ fn extract_media_creation_time_from_file_metadata<'a>(
                         _ = std::io::stdin().read_line(&mut input);
                         input = input.trim().to_string();
                         if input.len() != 2 {
-                            println!("Invalid input {}. expected a two digit number, e.g. 12", input);
+                            println!(
+                                "Invalid input {}. expected a two digit number, e.g. 12",
+                                input
+                            );
                             continue;
                         }
                         if let Ok(month) = input.parse::<u32>() {
@@ -357,7 +374,10 @@ fn extract_media_creation_time_from_file_metadata<'a>(
                             println!("Invalid input {}. expected a number, e.g. 12", input)
                         }
                     };
-                    return Some(NaiveDateTime::new(NaiveDate::from_ymd(year, month, 1), NaiveTime::from_hms(0,0,0)));
+                    return Some(NaiveDateTime::new(
+                        NaiveDate::from_ymd(year, month, 1),
+                        NaiveTime::from_hms(0, 0, 0),
+                    ));
                 } else {
                     panic!("Unreachable.")
                 }
