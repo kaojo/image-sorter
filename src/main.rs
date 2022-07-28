@@ -23,6 +23,7 @@ fn main() {
     let mut skip_read_next_value = false;
     let mut conflict_mode = ConflictMode::Choose;
     let mut file_creation_fallback = false;
+    let mut delete_skipped_source_duplicates = false;
     for (i, arg) in args.iter().enumerate() {
         if skip_read_next_value {
             skip_read_next_value = false;
@@ -62,6 +63,8 @@ fn main() {
             skip_read_next_value = true;
         } else if arg == "--file-creation-fallback" || arg == "-s" {
             file_creation_fallback = true
+        } else if arg == "--delete-skipped-source-duplicates" || arg == "-q" {
+            delete_skipped_source_duplicates = true
         } else {
             if source_folder.is_none() {
                 source_folder = Option::Some(arg.to_owned());
@@ -94,6 +97,7 @@ fn main() {
             &date_regex,
             &conflict_mode,
             file_creation_fallback,
+            delete_skipped_source_duplicates,
         ),
     )
     .unwrap();
@@ -126,7 +130,8 @@ fn handle_file<'a>(
     target_parents: &'a mut HashSet<PathBuf>,
     date_regex: &'a Regex,
     conflict_mode: &'a ConflictMode,
-    file_creation_fallback: bool
+    file_creation_fallback: bool,
+    delete_skipped_source_duplicates: bool,
 ) -> impl FnMut(&DirEntry) + 'a {
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
@@ -140,7 +145,8 @@ fn handle_file<'a>(
                 target_parents,
                 date_regex,
                 conflict_mode,
-                file_creation_fallback
+                file_creation_fallback,
+                delete_skipped_source_duplicates,
             ) {
                 Ok(target_file) => {
                     let parent = target_file
@@ -183,6 +189,7 @@ fn handle_image(
     date_regex: &Regex,
     conflict_mode: &ConflictMode,
     file_creation_fallback: bool,
+    delete_skipped_source_duplicates: bool,
 ) -> Result<PathBuf, String> {
     println!("---------------");
     if verbose {
@@ -205,9 +212,26 @@ fn handle_image(
         );
 
     if target_path.exists() {
-        match handle_file_exists_at_target(&source_path, &target_path, conflict_mode) {
+        match handle_file_exists_at_target(&source_path, &target_path, conflict_mode, verbose) {
             Some(path_resolution) => target_path = path_resolution,
-            None => return Ok(target_path),
+            None => {
+                // None means file move/copy is skipped
+                if delete_skipped_source_duplicates {
+                    match mode {
+                        Mode::DryRun => {
+                            println!("Dry run: Deleting skipped source file {:?}", source_path)
+                        }
+                        Mode::Move => {
+                            if verbose {
+                                println!("Deleting skipped source file {:?}", source_path);
+                            }
+                            fs::remove_file(source_path).map_err(|e| e.to_string())?;
+                        },
+                        _ => {}
+                    }
+                }
+                return Ok(target_path);
+            }
         }
     }
     match mode {
@@ -217,18 +241,22 @@ fn handle_image(
         ),
         Mode::Move => {
             handle_missing_parents(verbose, &target_path, target_parents)?;
-            println!(
-                "Moving source file {:?} to target {:?}",
-                source_path, target_path
-            );
+            if verbose {
+                println!(
+                    "Moving source file {:?} to target {:?}",
+                    source_path, target_path
+                );
+            }
             fs::rename(&source_path, &target_path).map_err(|e| e.to_string())?;
         }
         Mode::Copy => {
             handle_missing_parents(verbose, &target_path, target_parents)?;
-            println!(
-                "Copying source file {:?} to target {:?}",
-                source_path, target_path
-            );
+            if verbose {
+                println!(
+                    "Copying source file {:?} to target {:?}",
+                    source_path, target_path
+                );
+            }
             fs::copy(&source_path, &target_path).map_err(|e| e.to_string())?;
         }
     }
@@ -249,7 +277,11 @@ fn handle_missing_parents<'a>(
     })
 }
 
-fn extract_date_time(path: &PathBuf, date_regex: &Regex, file_creation_fallback: bool) -> Result<NaiveDateTime, String> {
+fn extract_date_time(
+    path: &PathBuf,
+    date_regex: &Regex,
+    file_creation_fallback: bool,
+) -> Result<NaiveDateTime, String> {
     let result_from_media_metadata = if is_image(path) {
         let exifreader = exif::Reader::new();
         std::fs::File::open(path)
@@ -289,7 +321,10 @@ fn extract_date_time(path: &PathBuf, date_regex: &Regex, file_creation_fallback:
     result_from_media_metadata
         .ok()
         .or_else(extract_media_creation_time_from_filename(date_regex, path))
-        .or_else(extract_media_creation_time_from_file_metadata(path, file_creation_fallback))
+        .or_else(extract_media_creation_time_from_file_metadata(
+            path,
+            file_creation_fallback,
+        ))
         .ok_or("Could not determine a media file creation date.".to_owned())
 }
 
@@ -420,6 +455,7 @@ fn handle_file_exists_at_target(
     source_path: &PathBuf,
     target_path: &PathBuf,
     conflict_mode: &ConflictMode,
+    verbose: bool,
 ) -> Option<PathBuf> {
     println!("Filename collision detected.");
     println!(
@@ -427,7 +463,9 @@ fn handle_file_exists_at_target(
         source_path, target_path
     );
     if source_path.metadata().unwrap().len() == target_path.metadata().unwrap().len() {
-        println!("Skipping the file {:?} because they already existing file has the same size and is likely same.", source_path);
+        if verbose {
+            println!("Skipping the file {:?} because they already existing file has the same size and is likely same.", source_path);
+        }
         return None;
     } else {
         let alternative_new_path = create_alternative_path(&target_path);
@@ -474,7 +512,9 @@ fn handle_file_exists_at_target(
                 if "1" == answer {
                     return Some(target_path.to_owned());
                 } else if "2" == answer {
-                    println!("Skipping file {:?}", source_path);
+                    if verbose {
+                        println!("Skipping file {:?}", source_path);
+                    }
                     return None;
                 } else if "3" == answer {
                     return Some(alternative_new_path);
