@@ -22,6 +22,7 @@ fn main() {
     let mut target_folder = Option::None;
     let mut skip_read_next_value = false;
     let mut conflict_mode = ConflictMode::Choose;
+    let mut file_creation_fallback = false;
     for (i, arg) in args.iter().enumerate() {
         if skip_read_next_value {
             skip_read_next_value = false;
@@ -59,6 +60,8 @@ fn main() {
                 _ => ConflictMode::Choose,
             };
             skip_read_next_value = true;
+        } else if arg == "--file-creation-fallback" || arg == "-s" {
+            file_creation_fallback = true
         } else {
             if source_folder.is_none() {
                 source_folder = Option::Some(arg.to_owned());
@@ -90,6 +93,7 @@ fn main() {
             &mut target_parents,
             &date_regex,
             &conflict_mode,
+            file_creation_fallback,
         ),
     )
     .unwrap();
@@ -122,6 +126,7 @@ fn handle_file<'a>(
     target_parents: &'a mut HashSet<PathBuf>,
     date_regex: &'a Regex,
     conflict_mode: &'a ConflictMode,
+    file_creation_fallback: bool
 ) -> impl FnMut(&DirEntry) + 'a {
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
@@ -135,6 +140,7 @@ fn handle_file<'a>(
                 target_parents,
                 date_regex,
                 conflict_mode,
+                file_creation_fallback
             ) {
                 Ok(target_file) => {
                     let parent = target_file
@@ -176,12 +182,13 @@ fn handle_image(
     target_parents: &HashSet<PathBuf>,
     date_regex: &Regex,
     conflict_mode: &ConflictMode,
+    file_creation_fallback: bool,
 ) -> Result<PathBuf, String> {
     println!("---------------");
     if verbose {
         println!("Found file {:?}.", source_path);
     }
-    let date_time = extract_date_time(&source_path, date_regex)?;
+    let date_time = extract_date_time(&source_path, date_regex, file_creation_fallback)?;
     if verbose {
         println!(
             "Image {:?} was taken at DateTime {}",
@@ -242,7 +249,7 @@ fn handle_missing_parents<'a>(
     })
 }
 
-fn extract_date_time(path: &PathBuf, date_regex: &Regex) -> Result<NaiveDateTime, String> {
+fn extract_date_time(path: &PathBuf, date_regex: &Regex, file_creation_fallback: bool) -> Result<NaiveDateTime, String> {
     let result_from_media_metadata = if is_image(path) {
         let exifreader = exif::Reader::new();
         std::fs::File::open(path)
@@ -282,7 +289,7 @@ fn extract_date_time(path: &PathBuf, date_regex: &Regex) -> Result<NaiveDateTime
     result_from_media_metadata
         .ok()
         .or_else(extract_media_creation_time_from_filename(date_regex, path))
-        .or_else(extract_media_creation_time_from_file_metadata(path))
+        .or_else(extract_media_creation_time_from_file_metadata(path, file_creation_fallback))
         .ok_or("Could not determine a media file creation date.".to_owned())
 }
 
@@ -314,6 +321,7 @@ fn extract_media_creation_time_from_filename<'a>(
 
 fn extract_media_creation_time_from_file_metadata<'a>(
     path: &'a PathBuf,
+    file_creation_fallback: bool,
 ) -> impl FnOnce() -> Option<NaiveDateTime> + 'a {
     move || {
         let file_creation_date = path
@@ -322,6 +330,10 @@ fn extract_media_creation_time_from_file_metadata<'a>(
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| NaiveDateTime::from_timestamp_opt(duration.as_secs() as i64, 0));
+
+        if file_creation_fallback && file_creation_date.is_some() {
+            return file_creation_date;
+        }
 
         match file_creation_date {
             Some(date) => {
