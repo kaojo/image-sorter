@@ -148,7 +148,7 @@ fn handle_file<'a>(
                 file_creation_fallback,
                 delete_skipped_source_duplicates,
             ) {
-                Ok(target_file) => {
+                Ok(Some(target_file)) => {
                     let parent = target_file
                         .parent()
                         .expect("File and parent exist")
@@ -156,6 +156,11 @@ fn handle_file<'a>(
                         .clone();
                     if !target_parents.contains(&parent) {
                         target_parents.insert(parent);
+                    }
+                }
+                Ok(None) => {
+                    if verbose {
+                        println!("Skipped file.");
                     }
                 }
                 Err(e) => {
@@ -190,7 +195,7 @@ fn handle_image(
     conflict_mode: &ConflictMode,
     file_creation_fallback: bool,
     delete_skipped_source_duplicates: bool,
-) -> Result<PathBuf, String> {
+) -> Result<Option<PathBuf>, String> {
     println!("---------------");
     if verbose {
         println!("Found file {:?}.", source_path);
@@ -202,7 +207,7 @@ fn handle_image(
             source_path, date_time
         )
     }
-    let mut target_path = target_directory
+    let target_path_unverified = target_directory
         .join(date_time.year().to_string())
         .join(date_time.month().to_string())
         .join(
@@ -211,9 +216,71 @@ fn handle_image(
                 .expect("we only supply valid files."),
         );
 
-    if target_path.exists() {
-        match handle_file_exists_at_target(&source_path, &target_path, conflict_mode, verbose) {
-            Some(path_resolution) => target_path = path_resolution,
+    let path_check_result = validate_and_resolve_path_problems(
+        target_path_unverified,
+        source_path,
+        conflict_mode,
+        verbose,
+        delete_skipped_source_duplicates,
+        mode,
+    )?;
+    match path_check_result {
+        Some(valid_path) => {
+            match mode {
+                Mode::DryRun => println!(
+                    "Dry run: Copy/Move source file {:?} to target {:?}",
+                    source_path, valid_path
+                ),
+                Mode::Move => {
+                    handle_missing_parents(verbose, &valid_path, target_parents)?;
+                    if verbose {
+                        println!(
+                            "Moving source file {:?} to target {:?}",
+                            source_path, valid_path
+                        );
+                    }
+                    fs::rename(&source_path, &valid_path).map_err(|e| e.to_string())?;
+                }
+                Mode::Copy => {
+                    handle_missing_parents(verbose, &valid_path, target_parents)?;
+                    if verbose {
+                        println!(
+                            "Copying source file {:?} to target {:?}",
+                            source_path, valid_path
+                        );
+                    }
+                    fs::copy(&source_path, &valid_path).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(Some(valid_path))
+        }
+        None => Ok(None),
+    }
+}
+
+fn validate_and_resolve_path_problems(
+    target_path_unverified: PathBuf,
+    source_path: &PathBuf,
+    conflict_mode: &ConflictMode,
+    verbose: bool,
+    delete_skipped_source_duplicates: bool,
+    mode: &Mode,
+) -> Result<Option<PathBuf>, String> {
+    if target_path_unverified.exists() {
+        match handle_file_exists_at_target(
+            &source_path,
+            &target_path_unverified,
+            conflict_mode,
+            verbose,
+        ) {
+            Some(path_resolution) => validate_and_resolve_path_problems(
+                path_resolution,
+                source_path,
+                conflict_mode,
+                verbose,
+                delete_skipped_source_duplicates,
+                mode,
+            ),
             None => {
                 // None means file move/copy is skipped
                 if delete_skipped_source_duplicates {
@@ -226,41 +293,16 @@ fn handle_image(
                                 println!("Deleting skipped source file {:?}", source_path);
                             }
                             fs::remove_file(source_path).map_err(|e| e.to_string())?;
-                        },
+                        }
                         _ => {}
                     }
                 }
-                return Ok(target_path);
+                Err("file is skipped.".to_string())
             }
         }
+    } else {
+        Ok(Some(target_path_unverified))
     }
-    match mode {
-        Mode::DryRun => println!(
-            "Dry run: Copy/Move source file {:?} to target {:?}",
-            source_path, target_path
-        ),
-        Mode::Move => {
-            handle_missing_parents(verbose, &target_path, target_parents)?;
-            if verbose {
-                println!(
-                    "Moving source file {:?} to target {:?}",
-                    source_path, target_path
-                );
-            }
-            fs::rename(&source_path, &target_path).map_err(|e| e.to_string())?;
-        }
-        Mode::Copy => {
-            handle_missing_parents(verbose, &target_path, target_parents)?;
-            if verbose {
-                println!(
-                    "Copying source file {:?} to target {:?}",
-                    source_path, target_path
-                );
-            }
-            fs::copy(&source_path, &target_path).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(target_path)
 }
 
 fn handle_missing_parents<'a>(
@@ -537,11 +579,7 @@ fn create_alternative_path(path: &PathBuf) -> PathBuf {
         .expect("Should always have a file stem.")
         .to_owned()
         + "_new";
-    let mut new_path = change_file_name(path, new_name.as_str());
-    if new_path.exists() {
-        new_path = create_alternative_path(&new_path);
-    }
-    new_path
+    change_file_name(path, new_name.as_str())
 }
 
 fn change_file_name(path: &PathBuf, name: &str) -> PathBuf {
