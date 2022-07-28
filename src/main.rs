@@ -297,7 +297,7 @@ fn validate_and_resolve_path_problems(
                         _ => {}
                     }
                 }
-                Err("file is skipped.".to_string())
+                Ok(None)
             }
         }
     } else {
