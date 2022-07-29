@@ -12,18 +12,40 @@ use std::process::exit;
 use std::time::UNIX_EPOCH;
 
 fn main() {
-    let mut args: Vec<String> = env::args().collect();
-    args.remove(0);
+    let args: Vec<String> = env::args().collect();
+    let options: Options = parse_options(args);
 
+    let date_regex = Regex::new(r"(?P<y>20[012]\d)\-?(?P<m>[01]\d)\-?(?P<d>\d{2})").unwrap();
+    let mut target_parents = HashSet::new();
+
+    visit_dirs(
+        &options.source_folder,
+        &mut handle_file(&options, &mut target_parents, &date_regex),
+    )
+    .unwrap();
+}
+
+struct Options {
+    pub verbose: bool,
+    pub mode: Mode,
+    pub source_folder: PathBuf,
+    pub target_folder: PathBuf,
+    pub file_conflict_resolution_mode: FileConflictResolutionMode,
+    pub media_creation_date_file_creation_fallback: bool,
+    pub delete_skipped_source_duplicates: bool,
+}
+
+fn parse_options(args: Vec<String>) -> Options {
     let mut mode = Mode::Move;
     let mut mode_set = false;
     let mut verbose: bool = false;
-    let mut source_folder = Option::None;
-    let mut target_folder = Option::None;
-    let mut skip_read_next_value = false;
-    let mut conflict_mode = ConflictMode::Choose;
-    let mut file_creation_fallback = false;
+    let mut source_folder_str = Option::None;
+    let mut target_folder_str = Option::None;
+    let mut file_conflict_resolution_mode = FileConflictResolutionMode::Choose;
+    let mut media_creation_date_file_creation_fallback = false;
     let mut delete_skipped_source_duplicates = false;
+
+    let mut skip_read_next_value = true;
     for (i, arg) in args.iter().enumerate() {
         if skip_read_next_value {
             skip_read_next_value = false;
@@ -50,57 +72,51 @@ fn main() {
             mode = Mode::Move;
             mode_set = true;
         } else if arg == "--target" || arg == "-t" {
-            target_folder = args.get(i + 1);
+            target_folder_str = args.get(i + 1);
             skip_read_next_value = true;
         } else if arg == "--conflict-mode" || arg == "-k" {
             let cm = args.get(i + 1).map(|s| s.as_str());
-            conflict_mode = match cm {
-                Some("both") => ConflictMode::KeepBoth,
-                Some("source") => ConflictMode::KeepSource,
-                Some("target") => ConflictMode::KeepTarget,
-                _ => ConflictMode::Choose,
+            file_conflict_resolution_mode = match cm {
+                Some("both") => FileConflictResolutionMode::KeepBoth,
+                Some("source") => FileConflictResolutionMode::KeepSource,
+                Some("target") => FileConflictResolutionMode::KeepTarget,
+                _ => FileConflictResolutionMode::Choose,
             };
             skip_read_next_value = true;
         } else if arg == "--file-creation-fallback" || arg == "-s" {
-            file_creation_fallback = true
+            media_creation_date_file_creation_fallback = true
         } else if arg == "--delete-skipped-source-duplicates" || arg == "-q" {
             delete_skipped_source_duplicates = true
         } else {
-            if source_folder.is_none() {
-                source_folder = Option::Some(arg.to_owned());
+            if source_folder_str.is_none() {
+                source_folder_str = Option::Some(arg.to_owned());
             } else {
                 exit_with_message::<bool>("Too many arguments given.");
             }
         }
     }
 
-    let source_directory = Path::new(source_folder.get_or_insert(".".to_string()));
-    let target_directory = target_folder
+    let source_folder = Path::new(source_folder_str.get_or_insert(".".to_string())).to_path_buf();
+    let target_folder = target_folder_str
         .map(|s| Path::new(s))
-        .unwrap_or_else(|| exit_with_message("No target folder supplied."));
-    if !target_directory.exists() {
+        .unwrap_or_else(|| exit_with_message("No target folder supplied."))
+        .to_path_buf();
+
+    if !target_folder.exists() {
         exit_with_message::<bool>(
             "Target folder does not exists or you are missing the required permissions.",
         );
     }
 
-    let mut target_parents = HashSet::new();
-    let date_regex = Regex::new(r"(?P<y>20[012]\d)\-?(?P<m>[01]\d)\-?(?P<d>\d{2})").unwrap();
-
-    visit_dirs(
-        &source_directory,
-        &mut handle_file(
-            verbose,
-            target_directory,
-            &mode,
-            &mut target_parents,
-            &date_regex,
-            &conflict_mode,
-            file_creation_fallback,
-            delete_skipped_source_duplicates,
-        ),
-    )
-    .unwrap();
+    Options {
+        verbose,
+        mode,
+        source_folder,
+        target_folder,
+        file_conflict_resolution_mode,
+        media_creation_date_file_creation_fallback,
+        delete_skipped_source_duplicates,
+    }
 }
 
 fn exit_with_message<T>(message: &str) -> T {
@@ -124,30 +140,15 @@ fn visit_dirs(dir: &Path, cb: &mut dyn FnMut(&DirEntry)) -> io::Result<()> {
 }
 
 fn handle_file<'a>(
-    verbose: bool,
-    target_directory: &'a Path,
-    mode: &'a Mode,
+    options: &'a Options,
     target_parents: &'a mut HashSet<PathBuf>,
     date_regex: &'a Regex,
-    conflict_mode: &'a ConflictMode,
-    file_creation_fallback: bool,
-    delete_skipped_source_duplicates: bool,
 ) -> impl FnMut(&DirEntry) + 'a {
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
 
         if is_supported_file_type(&source_path) {
-            match handle_image(
-                verbose,
-                &source_path,
-                target_directory,
-                mode,
-                target_parents,
-                date_regex,
-                conflict_mode,
-                file_creation_fallback,
-                delete_skipped_source_duplicates,
-            ) {
+            match handle_image(options, &source_path, target_parents, date_regex) {
                 Ok(Some(target_file)) => {
                     let parent = target_file
                         .parent()
@@ -159,7 +160,7 @@ fn handle_file<'a>(
                     }
                 }
                 Ok(None) => {
-                    if verbose {
+                    if options.verbose {
                         println!("Skipped file.");
                     }
                 }
@@ -168,7 +169,7 @@ fn handle_file<'a>(
                 }
             }
         } else {
-            if verbose {
+            if options.verbose {
                 println!("=========");
                 println!("File {:?} is not a supported file type", source_path);
             }
@@ -186,28 +187,28 @@ fn is_supported_file_type(source_path: &PathBuf) -> bool {
 }
 
 fn handle_image(
-    verbose: bool,
+    options: &Options,
     source_path: &PathBuf,
-    target_directory: &Path,
-    mode: &Mode,
     target_parents: &HashSet<PathBuf>,
     date_regex: &Regex,
-    conflict_mode: &ConflictMode,
-    file_creation_fallback: bool,
-    delete_skipped_source_duplicates: bool,
 ) -> Result<Option<PathBuf>, String> {
     println!("---------------");
-    if verbose {
+    if options.verbose {
         println!("Found file {:?}.", source_path);
     }
-    let date_time = extract_date_time(&source_path, date_regex, file_creation_fallback)?;
-    if verbose {
+    let date_time = extract_date_time(
+        &source_path,
+        date_regex,
+        options.media_creation_date_file_creation_fallback,
+    )?;
+    if options.verbose {
         println!(
             "Image {:?} was taken at DateTime {}",
             source_path, date_time
         )
     }
-    let target_path_unverified = target_directory
+    let target_path_unverified = options
+        .target_folder
         .join(date_time.year().to_string())
         .join(date_time.month().to_string())
         .join(
@@ -216,24 +217,18 @@ fn handle_image(
                 .expect("we only supply valid files."),
         );
 
-    let path_check_result = validate_and_resolve_path_problems(
-        target_path_unverified,
-        source_path,
-        conflict_mode,
-        verbose,
-        delete_skipped_source_duplicates,
-        mode,
-    )?;
+    let path_check_result =
+        validate_and_resolve_path_problems(options, target_path_unverified, source_path)?;
     match path_check_result {
         Some(valid_path) => {
-            match mode {
+            match options.mode {
                 Mode::DryRun => println!(
                     "Dry run: Copy/Move source file {:?} to target {:?}",
                     source_path, valid_path
                 ),
                 Mode::Move => {
-                    handle_missing_parents(verbose, &valid_path, target_parents)?;
-                    if verbose {
+                    handle_missing_parents(options.verbose, &valid_path, target_parents)?;
+                    if options.verbose {
                         println!(
                             "Moving source file {:?} to target {:?}",
                             source_path, valid_path
@@ -242,8 +237,8 @@ fn handle_image(
                     fs::rename(&source_path, &valid_path).map_err(|e| e.to_string())?;
                 }
                 Mode::Copy => {
-                    handle_missing_parents(verbose, &valid_path, target_parents)?;
-                    if verbose {
+                    handle_missing_parents(options.verbose, &valid_path, target_parents)?;
+                    if options.verbose {
                         println!(
                             "Copying source file {:?} to target {:?}",
                             source_path, valid_path
@@ -259,37 +254,29 @@ fn handle_image(
 }
 
 fn validate_and_resolve_path_problems(
+    options: &Options,
     target_path_unverified: PathBuf,
     source_path: &PathBuf,
-    conflict_mode: &ConflictMode,
-    verbose: bool,
-    delete_skipped_source_duplicates: bool,
-    mode: &Mode,
 ) -> Result<Option<PathBuf>, String> {
     if target_path_unverified.exists() {
         match handle_file_exists_at_target(
             &source_path,
             &target_path_unverified,
-            conflict_mode,
-            verbose,
+            &options.file_conflict_resolution_mode,
+            options.verbose,
         ) {
-            Some(path_resolution) => validate_and_resolve_path_problems(
-                path_resolution,
-                source_path,
-                conflict_mode,
-                verbose,
-                delete_skipped_source_duplicates,
-                mode,
-            ),
+            Some(path_resolution) => {
+                validate_and_resolve_path_problems(options, path_resolution, source_path)
+            }
             None => {
                 // None means file move/copy is skipped
-                if delete_skipped_source_duplicates {
-                    match mode {
+                if options.delete_skipped_source_duplicates {
+                    match options.mode {
                         Mode::DryRun => {
                             println!("Dry run: Deleting skipped source file {:?}", source_path)
                         }
                         Mode::Move => {
-                            if verbose {
+                            if options.verbose {
                                 println!("Deleting skipped source file {:?}", source_path);
                             }
                             fs::remove_file(source_path).map_err(|e| e.to_string())?;
@@ -496,7 +483,7 @@ fn is_image(path: &PathBuf) -> bool {
 fn handle_file_exists_at_target(
     source_path: &PathBuf,
     target_path: &PathBuf,
-    conflict_mode: &ConflictMode,
+    conflict_mode: &FileConflictResolutionMode,
     verbose: bool,
 ) -> Option<PathBuf> {
     println!("Filename collision detected.");
@@ -512,7 +499,7 @@ fn handle_file_exists_at_target(
     } else {
         let alternative_new_path = create_alternative_path(&target_path);
         match conflict_mode {
-            ConflictMode::Choose => {
+            FileConflictResolutionMode::Choose => {
                 println!("Choose a resolution:");
                 println!(
                     "1) Override the target file with the source file (Size {:?}).",
@@ -564,9 +551,9 @@ fn handle_file_exists_at_target(
                     panic!("Unreachable.")
                 }
             }
-            ConflictMode::KeepSource => Some(target_path.to_owned()),
-            ConflictMode::KeepTarget => None,
-            ConflictMode::KeepBoth => Some(alternative_new_path),
+            FileConflictResolutionMode::KeepSource => Some(target_path.to_owned()),
+            FileConflictResolutionMode::KeepTarget => None,
+            FileConflictResolutionMode::KeepBoth => Some(alternative_new_path),
         }
     }
 }
@@ -597,7 +584,7 @@ enum Mode {
     Copy,
 }
 
-enum ConflictMode {
+enum FileConflictResolutionMode {
     Choose,
     KeepSource,
     KeepTarget,
