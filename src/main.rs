@@ -30,6 +30,7 @@ struct Options {
     pub mode: Mode,
     pub source_folder: PathBuf,
     pub target_folder: PathBuf,
+    pub include_unsupported_file_types: bool,
     pub file_conflict_resolution_mode: FileConflictResolutionMode,
     pub media_creation_date_file_creation_fallback: bool,
     pub delete_skipped_source_duplicates: bool,
@@ -44,6 +45,7 @@ fn parse_options(args: Vec<String>) -> Options {
     let mut file_conflict_resolution_mode = FileConflictResolutionMode::Choose;
     let mut media_creation_date_file_creation_fallback = false;
     let mut delete_skipped_source_duplicates = false;
+    let mut include_unsupported_file_types = false;
 
     let mut skip_read_next_value = true;
     for (i, arg) in args.iter().enumerate() {
@@ -87,6 +89,8 @@ fn parse_options(args: Vec<String>) -> Options {
             media_creation_date_file_creation_fallback = true
         } else if arg == "--delete-skipped-source-duplicates" || arg == "-q" {
             delete_skipped_source_duplicates = true
+        } else if arg == "--include-unsupported-file-types" || arg == "-u" {
+            include_unsupported_file_types = true
         } else {
             if source_folder_str.is_none() {
                 source_folder_str = Option::Some(arg.to_owned());
@@ -116,6 +120,7 @@ fn parse_options(args: Vec<String>) -> Options {
         file_conflict_resolution_mode,
         media_creation_date_file_creation_fallback,
         delete_skipped_source_duplicates,
+        include_unsupported_file_types,
     }
 }
 
@@ -147,8 +152,16 @@ fn handle_file<'a>(
     move |dir_entry: &DirEntry| -> () {
         let source_path = dir_entry.path();
 
-        if is_supported_file_type(&source_path) {
-            match handle_image(options, &source_path, target_parents, date_regex) {
+        if is_supported_file_type(&source_path) || options.include_unsupported_file_types {
+            let date_time = extract_date_time(
+                &source_path,
+                date_regex,
+                options.media_creation_date_file_creation_fallback,
+                options.verbose,
+            );
+            match date_time.and_then(|date_time| {
+                sort_file(options, &source_path, target_parents, &date_time)
+            }) {
                 Ok(Some(target_file)) => {
                     let parent = target_file
                         .parent()
@@ -181,31 +194,20 @@ fn is_supported_file_type(source_path: &PathBuf) -> bool {
     let is_supported = source_path
         .extension()
         .and_then(OsStr::to_str)
-        .filter(|&e| ["png", "jpg", "jpeg", "tif", "mp4"].contains(&e.to_lowercase().as_str()))
+        .filter(|&e| ["png", "jpg", "jpeg", "tif", "mp4", "mov"].contains(&e.to_lowercase().as_str()))
         .is_some();
     is_supported
 }
 
-fn handle_image(
+fn sort_file(
     options: &Options,
     source_path: &PathBuf,
     target_parents: &HashSet<PathBuf>,
-    date_regex: &Regex,
+    date_time: &NaiveDateTime,
 ) -> Result<Option<PathBuf>, String> {
     println!("---------------");
     if options.verbose {
         println!("Found file {:?}.", source_path);
-    }
-    let date_time = extract_date_time(
-        &source_path,
-        date_regex,
-        options.media_creation_date_file_creation_fallback,
-    )?;
-    if options.verbose {
-        println!(
-            "Image {:?} was taken at DateTime {}",
-            source_path, date_time
-        )
     }
     let target_path_unverified = options
         .target_folder
@@ -310,6 +312,7 @@ fn extract_date_time(
     path: &PathBuf,
     date_regex: &Regex,
     file_creation_fallback: bool,
+    verbose: bool,
 ) -> Result<NaiveDateTime, String> {
     let result_from_media_metadata = if is_image(path) {
         let exifreader = exif::Reader::new();
@@ -333,7 +336,7 @@ fn extract_date_time(
                 NaiveDateTime::parse_from_str(inner.as_str().trim(), "%Y-%m-%d %H:%M:%S")
                     .map_err(|e| e.to_string())
             })
-    } else {
+    } else if is_video(path) {
         ffprobe::ffprobe(path)
             .map_err(|e| e.to_string())?
             .format
@@ -345,16 +348,25 @@ fn extract_date_time(
             })
             .and_then(|str| DateTime::parse_from_rfc3339(str.as_str()).map_err(|e| e.to_string()))
             .map(|date_time| date_time.naive_local())
+    } else {
+        Err("Unsupported File Type".to_string())
     };
 
-    result_from_media_metadata
+    let result = result_from_media_metadata
         .ok()
         .or_else(extract_media_creation_time_from_filename(date_regex, path))
         .or_else(extract_media_creation_time_from_file_metadata(
             path,
             file_creation_fallback,
         ))
-        .ok_or("Could not determine a media file creation date.".to_owned())
+        .ok_or("Could not determine a media file creation date.".to_owned());
+
+    if let Ok(date_time) = result {
+        if verbose {
+            println!("Image {:?} was taken at DateTime {}", path, date_time)
+        }
+    }
+    result
 }
 
 fn extract_media_creation_time_from_filename<'a>(
@@ -408,15 +420,16 @@ fn extract_media_creation_time_from_file_metadata<'a>(
                 println!("Choose a resolution:");
                 println!("1) Use the file creation time: {:?}", date);
                 println!("2) Enter year and month manually.");
+                println!("3) Skip file. (it will not be deleted if the delete-skipped-source-duplicates flag is set.)");
                 let answer = loop {
                     let mut input = String::new();
                     _ = std::io::stdin().read_line(&mut input);
                     input = input.trim().to_string();
-                    if ["1", "2"].contains(&input.as_str()) {
+                    if ["1", "2", "3"].contains(&input.as_str()) {
                         println!("Your option: {}", input);
                         break input;
                     } else {
-                        println!("Invalid option {}. Choose 1, 2", input)
+                        println!("Invalid option {}. Choose 1, 2 or 3", input)
                     }
                 };
                 if "1" == answer {
@@ -464,6 +477,8 @@ fn extract_media_creation_time_from_file_metadata<'a>(
                         NaiveDate::from_ymd(year, month, 1),
                         NaiveTime::from_hms(0, 0, 0),
                     ));
+                } else if "3" == answer {
+                    None
                 } else {
                     panic!("Unreachable.")
                 }
@@ -477,6 +492,13 @@ fn is_image(path: &PathBuf) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .filter(|&e| ["png", "jpg", "jpeg", "tif"].contains(&e.to_lowercase().as_str()))
+        .is_some()
+}
+
+fn is_video(path: &PathBuf) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .filter(|&e| ["mp4", "mov"].contains(&e.to_lowercase().as_str()))
         .is_some()
 }
 
@@ -511,7 +533,7 @@ fn handle_file_exists_at_target(
                     )
                 );
                 println!(
-                "2) Skip the source file and keep the file (Size: {:?}) at the target location. ",
+                "2) Skip the source file and keep the file (Size: {:?}) at the target location. (will delete source file if delete-skipped-source-duplicates flag is set)",
                 human_bytes(
                     target_path
                         .metadata()
